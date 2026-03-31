@@ -1,4 +1,5 @@
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
@@ -29,6 +30,7 @@ DISPLAY_COLUMNS = [
 
 API_REFRESH_SECONDS = 300
 PAGE_REFRESH_SECONDS = 60
+EASTERN_TZ = ZoneInfo("America/New_York")
 
 
 def parse_percent_value(value):
@@ -69,6 +71,42 @@ def format_plain_percent(value):
     if value is None or pd.isna(value):
         return "N/A"
     return f"{value:.1f}%"
+
+
+def format_eastern_time(value):
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        text = str(value).strip()
+        if not text:
+            return ""
+
+        if text.endswith(" ET"):
+            text = text[:-3].strip()
+            dt = pd.to_datetime(text, errors="coerce")
+            if pd.isna(dt):
+                return str(value)
+            dt = dt.to_pydatetime().replace(tzinfo=EASTERN_TZ)
+            return dt.strftime("%b %d, %-I:%M %p ET")
+
+        dt = pd.to_datetime(text, utc=True, errors="coerce")
+        if pd.isna(dt):
+            dt = pd.to_datetime(text, errors="coerce")
+            if pd.isna(dt):
+                return str(value)
+            dt = dt.tz_localize(EASTERN_TZ) if dt.tzinfo is None else dt.tz_convert(EASTERN_TZ)
+            return dt.strftime("%b %d, %-I:%M %p ET")
+        dt = dt.tz_convert(EASTERN_TZ).to_pydatetime()
+        return dt.strftime("%b %d, %-I:%M %p ET")
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=EASTERN_TZ)
+    else:
+        dt = dt.astimezone(EASTERN_TZ)
+    return dt.strftime("%b %d, %-I:%M %p ET")
 
 
 def edge_sort_value(value):
@@ -143,7 +181,7 @@ def style_signal(value):
 @st.cache_data(ttl=API_REFRESH_SECONDS, show_spinner=False)
 def load_market_data():
     data = predict_today().copy()
-    fetched_at = datetime.now()
+    fetched_at = datetime.now(EASTERN_TZ)
     return data, fetched_at
 
 
@@ -168,6 +206,7 @@ def prepare_data(data):
         if column not in data.columns:
             data[column] = ""
 
+    data["Commence Time"] = data["Commence Time"].apply(format_eastern_time)
     data["Market"] = data["Market"].apply(normalize_market)
     data["confidence_raw"] = data["Confidence"].apply(lambda value: parse_percent_value(value) or 0.0)
     data["edge_sort"] = data["Edge"].apply(edge_sort_value)
@@ -237,8 +276,8 @@ else:
         ascending=[False, False, True, True],
     ).reset_index(drop=True)
 
-page_refresh_time = datetime.now().strftime("%I:%M:%S %p")
-data_refresh_time = last_data_refresh.strftime("%I:%M:%S %p")
+page_refresh_time = datetime.now(EASTERN_TZ).strftime("%b %d, %-I:%M %p ET")
+data_refresh_time = format_eastern_time(last_data_refresh)
 best_edge = filtered_data["edge_sort"].max() if not filtered_data.empty else None
 best_edge_text = f"{best_edge:+.1f}%" if best_edge is not None and best_edge > -9999 else "N/A"
 
