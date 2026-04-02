@@ -1,5 +1,6 @@
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -63,7 +64,7 @@ def should_call_api(now_et, last_fetch_time):
 
 
 def count_future_events(events):
-    now_utc = pd.Timestamp.now(tz="UTC")
+    now_utc = datetime.now(timezone.utc)
     future_count = 0
 
     for event in events or []:
@@ -142,8 +143,8 @@ def get_events(force_refresh=False):
 
 
 def filter_future_events(events):
-    now_utc = pd.Timestamp.now(tz="UTC")
-    print(f"Current UTC time: {now_utc.isoformat()}")
+    now_utc = datetime.now(timezone.utc)
+    print("NOW UTC:", now_utc)
     print(f"Number of events before filtering: {len(events)}")
 
     samples = []
@@ -154,11 +155,13 @@ def filter_future_events(events):
         if len(samples) < 3:
             samples.append(commence_raw)
 
-        commence_time_utc = parse_commence_time_utc(commence_raw)
-        if commence_time_utc is None:
+        game_time = parse_commence_time_utc(commence_raw)
+        if game_time is None:
             continue
 
-        if now_utc < commence_time_utc:
+        print("GAME TIME UTC:", game_time)
+
+        if game_time > now_utc:
             future_events.append(event)
 
     print(f"First 3 commence_time values: {samples}")
@@ -230,10 +233,15 @@ def format_commence_time(value):
 
 
 def parse_commence_time_utc(value):
-    dt = pd.to_datetime(value, utc=True, errors="coerce")
-    if pd.isna(dt):
+    if not value:
         return None
-    return dt
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        dt = pd.to_datetime(value, utc=True, errors="coerce")
+        if pd.isna(dt):
+            return None
+        return dt.to_pydatetime().astimezone(timezone.utc)
 
 
 def build_game_id(away_team, home_team, commence_time_utc):
