@@ -174,6 +174,19 @@ def format_commence_time(value):
     return eastern.strftime("%b %d, %-I:%M %p ET")
 
 
+def parse_commence_time_utc(value):
+    dt = pd.to_datetime(value, utc=True, errors="coerce")
+    if pd.isna(dt):
+        return None
+    return dt
+
+
+def build_game_id(away_team, home_team, commence_time_utc):
+    if commence_time_utc is None:
+        return f"{away_team}_{home_team}"
+    return f"{away_team}_{home_team}_{commence_time_utc.strftime('%Y%m%dT%H%M%SZ')}"
+
+
 def calculate_vig_free_probabilities(odds_a, odds_b):
     implied_a = american_to_implied_probability(odds_a)
     implied_b = american_to_implied_probability(odds_b)
@@ -395,6 +408,7 @@ def calculate_confidence(model_probability):
 
 def base_row(game, commence_time, market, sportsbook, sportsbook_line, recommended_pick, confidence, edge):
     return {
+        "Game ID": None,
         "Game": game,
         "Commence Time": commence_time,
         "Market": market,
@@ -412,7 +426,7 @@ def base_row(game, commence_time, market, sportsbook, sportsbook_line, recommend
     }
 
 
-def build_moneyline_row(game, commence_time, sportsbook, away_team, home_team, market, snapshots_df):
+def build_moneyline_row(game_id, game, commence_time, sportsbook, away_team, home_team, market, snapshots_df):
     prices = {}
     for outcome in market.get("outcomes", []):
         name = outcome.get("name")
@@ -451,10 +465,12 @@ def build_moneyline_row(game, commence_time, sportsbook, away_team, home_team, m
         edge = home_edge
 
     confidence = calculate_confidence(selected_model_probability)
-    return base_row(game, commence_time, "Moneyline", sportsbook, sportsbook_line, recommended_pick, confidence, edge)
+    row = base_row(game, commence_time, "Moneyline", sportsbook, sportsbook_line, recommended_pick, confidence, edge)
+    row["Game ID"] = game_id
+    return row
 
 
-def build_spread_row(game, commence_time, sportsbook, away_team, home_team, market, snapshots_df):
+def build_spread_row(game_id, game, commence_time, sportsbook, away_team, home_team, market, snapshots_df):
     sides = {}
     for outcome in market.get("outcomes", []):
         name = outcome.get("name")
@@ -503,11 +519,12 @@ def build_spread_row(game, commence_time, sportsbook, away_team, home_team, mark
     confidence = calculate_confidence(selected_model_probability)
     edge = round(edge, 1)
     row = base_row(game, commence_time, "Spread", sportsbook, sportsbook_line, recommended_pick, confidence, edge)
+    row["Game ID"] = game_id
     row["Recommended Pick"] = f"{recommended_pick} {format_point(selected_point)}"
     return row
 
 
-def build_total_row(game, commence_time, sportsbook, market, snapshots_df):
+def build_total_row(game_id, game, commence_time, sportsbook, market, snapshots_df):
     sides = {}
     for outcome in market.get("outcomes", []):
         name = outcome.get("name")
@@ -566,6 +583,7 @@ def build_total_row(game, commence_time, sportsbook, market, snapshots_df):
     confidence = calculate_confidence(selected_model_probability)
     edge = round(edge, 1)
     row = base_row(game, commence_time, "Total", sportsbook, sportsbook_line, recommended_pick, confidence, edge)
+    row["Game ID"] = game_id
     row["Recommended Pick"] = f"{recommended_pick} {selected_point:g}"
     return row
 
@@ -599,14 +617,19 @@ def enrich_signal_columns(row, snapshots_df):
 def build_predictions():
     events = get_events()
     snapshots_df = load_snapshots()
+    now_utc = pd.Timestamp.now(tz="UTC")
     rows = []
     snapshot_rows = []
 
     for event in events:
         away_team = event.get("away_team")
         home_team = event.get("home_team")
+        commence_time_utc = parse_commence_time_utc(event.get("commence_time"))
 
-        if not away_team or not home_team:
+        if not away_team or not home_team or commence_time_utc is None:
+            continue
+
+        if now_utc >= commence_time_utc:
             continue
 
         bookmaker = get_preferred_bookmaker(event)
@@ -615,15 +638,17 @@ def build_predictions():
 
         sportsbook = bookmaker.get("title", bookmaker.get("key", ""))
         game = f"{away_team} at {home_team}"
-        commence_time = format_commence_time(event.get("commence_time"))
+        game_id = build_game_id(away_team, home_team, commence_time_utc)
+        commence_time = format_commence_time(commence_time_utc)
         moneyline_market = get_market(bookmaker, "h2h")
 
         if moneyline_market:
-            row = build_moneyline_row(game, commence_time, sportsbook, away_team, home_team, moneyline_market, snapshots_df)
+            row = build_moneyline_row(game_id, game, commence_time, sportsbook, away_team, home_team, moneyline_market, snapshots_df)
             if row:
                 rows.append(enrich_signal_columns(row, snapshots_df))
                 snapshot_rows.append(
                     {
+                        "Game ID": row["Game ID"],
                         "Game": row["Game"],
                         "Commence Time": row["Commence Time"],
                         "Market": row["Market"],
@@ -637,11 +662,12 @@ def build_predictions():
 
         spread_market = get_market(bookmaker, "spreads")
         if spread_market:
-            row = build_spread_row(game, commence_time, sportsbook, away_team, home_team, spread_market, snapshots_df)
+            row = build_spread_row(game_id, game, commence_time, sportsbook, away_team, home_team, spread_market, snapshots_df)
             if row:
                 rows.append(enrich_signal_columns(row, snapshots_df))
                 snapshot_rows.append(
                     {
+                        "Game ID": row["Game ID"],
                         "Game": row["Game"],
                         "Commence Time": row["Commence Time"],
                         "Market": row["Market"],
@@ -655,11 +681,12 @@ def build_predictions():
 
         total_market = get_market(bookmaker, "totals")
         if total_market:
-            row = build_total_row(game, commence_time, sportsbook, total_market, snapshots_df)
+            row = build_total_row(game_id, game, commence_time, sportsbook, total_market, snapshots_df)
             if row:
                 rows.append(enrich_signal_columns(row, snapshots_df))
                 snapshot_rows.append(
                     {
+                        "Game ID": row["Game ID"],
                         "Game": row["Game"],
                         "Commence Time": row["Commence Time"],
                         "Market": row["Market"],
@@ -677,6 +704,7 @@ def build_predictions():
     result = pd.DataFrame(
         rows,
         columns=[
+            "Game ID",
             "Game",
             "Commence Time",
             "Market",
