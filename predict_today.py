@@ -226,19 +226,31 @@ def get_live_odds():
 
 
 def filter_future_events(events):
-    current_utc = now_utc()
+    now_utc_value = datetime.now(timezone.utc)
     future_events = []
 
+    print(f"Raw API event count: {len(events)}")
+    print(f"Current UTC time: {now_utc_value.isoformat()}")
+    print(f"First 3 raw commence_time values: {[event.get('commence_time') for event in events[:3]]}")
+
     for event in events:
-        commence_time = parse_commence_time_utc(event.get("commence_time"))
-        if commence_time and commence_time > current_utc:
+        commence_time = event.get("commence_time")
+        if not commence_time:
+            continue
+
+        try:
+            game_time_utc = datetime.fromisoformat(commence_time.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+
+        if game_time_utc > now_utc_value:
             future_events.append(event)
 
-    print(f"Number of future events after filtering: {len(future_events)}")
+    print(f"Future event count after filtering: {len(future_events)}")
     if events and not future_events:
         print("Raw API/cache events existed, but all were filtered out as past games")
-        print(f"Current UTC time: {current_utc.isoformat()}")
-        print(f"First 3 commence_time values: {debug_event_times(events)}")
+        print(f"Current UTC time: {now_utc_value.isoformat()}")
+        print(f"First 3 raw commence_time values: {[event.get('commence_time') for event in events[:3]]}")
 
     return future_events
 
