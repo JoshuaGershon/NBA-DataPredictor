@@ -33,6 +33,25 @@ PAGE_REFRESH_SECONDS = 60
 EASTERN_TZ = ZoneInfo("America/New_York")
 
 
+def eastern_now():
+    return datetime.now(EASTERN_TZ)
+
+
+def format_refresh_time_et(value):
+    if value is None:
+        return ""
+    if not isinstance(value, datetime):
+        value = pd.to_datetime(value, errors="coerce")
+        if pd.isna(value):
+            return ""
+        value = value.to_pydatetime()
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=EASTERN_TZ)
+    else:
+        value = value.astimezone(EASTERN_TZ)
+    return value.strftime("%I:%M:%S %p ET")
+
+
 def parse_percent_value(value):
     if pd.isna(value) or value in ("", None):
         return None
@@ -71,42 +90,6 @@ def format_plain_percent(value):
     if value is None or pd.isna(value):
         return "N/A"
     return f"{value:.1f}%"
-
-
-def format_eastern_time(value):
-    if value is None or (isinstance(value, float) and pd.isna(value)):
-        return ""
-
-    if isinstance(value, datetime):
-        dt = value
-    else:
-        text = str(value).strip()
-        if not text:
-            return ""
-
-        if text.endswith(" ET"):
-            text = text[:-3].strip()
-            dt = pd.to_datetime(text, errors="coerce")
-            if pd.isna(dt):
-                return str(value)
-            dt = dt.to_pydatetime().replace(tzinfo=EASTERN_TZ)
-            return dt.strftime("%b %d, %-I:%M %p ET")
-
-        dt = pd.to_datetime(text, utc=True, errors="coerce")
-        if pd.isna(dt):
-            dt = pd.to_datetime(text, errors="coerce")
-            if pd.isna(dt):
-                return str(value)
-            dt = dt.tz_localize(EASTERN_TZ) if dt.tzinfo is None else dt.tz_convert(EASTERN_TZ)
-            return dt.strftime("%b %d, %-I:%M %p ET")
-        dt = dt.tz_convert(EASTERN_TZ).to_pydatetime()
-        return dt.strftime("%b %d, %-I:%M %p ET")
-
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=EASTERN_TZ)
-    else:
-        dt = dt.astimezone(EASTERN_TZ)
-    return dt.strftime("%b %d, %-I:%M %p ET")
 
 
 def edge_sort_value(value):
@@ -178,21 +161,34 @@ def style_signal(value):
     return "color: #94a3b8; font-weight: 600;"
 
 
-@st.cache_data(ttl=API_REFRESH_SECONDS, show_spinner=False)
 def load_market_data():
-    data = predict_today().copy()
-    fetched_at = datetime.now(EASTERN_TZ)
-    return data, fetched_at
+    now = eastern_now()
+    cached_df = st.session_state.get("market_data_df")
+    cached_at = st.session_state.get("market_data_fetched_at")
+
+    if cached_df is not None and cached_at is not None:
+        age_seconds = (now - cached_at).total_seconds()
+        if age_seconds < API_REFRESH_SECONDS:
+            return cached_df.copy(), cached_at, "CACHE"
+
+    fresh_df = predict_today().copy()
+    st.session_state["market_data_df"] = fresh_df.copy()
+    st.session_state["market_data_fetched_at"] = now
+    return fresh_df, now, "API"
 
 
 def prepare_data(data):
     if data.empty:
         return data
 
+    if "Game ID" not in data.columns:
+        data["Game ID"] = data["Game"] if "Game" in data.columns else range(len(data))
+
     if "Sportsbook" not in data.columns:
         data["Sportsbook"] = ""
 
     base_columns = [
+        "Game ID",
         "Game",
         "Commence Time",
         "Market",
@@ -206,7 +202,6 @@ def prepare_data(data):
         if column not in data.columns:
             data[column] = ""
 
-    data["Commence Time"] = data["Commence Time"].apply(format_eastern_time)
     data["Market"] = data["Market"].apply(normalize_market)
     data["confidence_raw"] = data["Confidence"].apply(lambda value: parse_percent_value(value) or 0.0)
     data["edge_sort"] = data["Edge"].apply(edge_sort_value)
@@ -261,7 +256,7 @@ components.html(
     height=0,
 )
 
-raw_data, last_data_refresh = load_market_data()
+raw_data, last_data_refresh, data_source = load_market_data()
 data = prepare_data(raw_data)
 
 market_options = ["All", "Moneyline", "Spread", "Total"]
@@ -276,31 +271,41 @@ else:
         ascending=[False, False, True, True],
     ).reset_index(drop=True)
 
-page_refresh_time = datetime.now(EASTERN_TZ).strftime("%b %d, %-I:%M %p ET")
-data_refresh_time = format_eastern_time(last_data_refresh)
+page_refresh_time = format_refresh_time_et(eastern_now())
+data_refresh_time = format_refresh_time_et(last_data_refresh)
 best_edge = filtered_data["edge_sort"].max() if not filtered_data.empty else None
 best_edge_text = f"{best_edge:+.1f}%" if best_edge is not None and best_edge > -9999 else "N/A"
+unique_games = filtered_data["Game ID"].nunique() if not filtered_data.empty else 0
+cached_future_games_count = data["Game ID"].nunique() if not data.empty else 0
 
 metric_cols = st.columns(3)
-metric_cols[0].metric("Number of Games", len(filtered_data))
+metric_cols[0].metric("Number of Games", unique_games)
 metric_cols[1].metric("Best Edge", best_edge_text)
 metric_cols[2].metric("Last Data Refresh", data_refresh_time)
+
+info_cols = st.columns(3)
+info_cols[0].metric("Data Source", data_source)
+info_cols[1].metric("Last Odds Refresh Time", data_refresh_time)
+info_cols[2].metric("Cached Future Games Count", cached_future_games_count)
 
 st.caption(
     f"Showing cached market data between API refreshes. Page refreshed at {page_refresh_time}; market data refreshes every {API_REFRESH_SECONDS // 60} minutes."
 )
 
+if cached_future_games_count == 0:
+    st.info("No future games remain in cache. A fresh API pull is required.")
+
 if data.empty:
-    st.info(getattr(raw_data, "attrs", {}).get("status", "No data available right now."))
+    st.info("No upcoming pregame games available.")
 else:
     strongest_signals = filtered_data[DISPLAY_COLUMNS].head(5)
     top_picks = filtered_data.sort_values(["edge_sort", "signal_score_raw"], ascending=[False, False]).head(5)[DISPLAY_COLUMNS]
     all_games = filtered_data[DISPLAY_COLUMNS]
 
-    st.subheader("Strongest Signals")
-    if strongest_signals.empty:
-        st.info("No games available for the selected market.")
+    if filtered_data.empty:
+        st.info("No upcoming pregame games available.")
     else:
+        st.subheader("Strongest Signals")
         st.dataframe(
             strongest_signals.style.map(style_edge, subset=["Edge"]).map(
                 style_signal,
@@ -310,10 +315,7 @@ else:
             hide_index=True,
         )
 
-    st.subheader("Top Picks")
-    if top_picks.empty:
-        st.info("No games available for the selected market.")
-    else:
+        st.subheader("Top Picks")
         st.dataframe(
             top_picks.style.map(style_edge, subset=["Edge"]).map(
                 style_signal,
@@ -323,10 +325,7 @@ else:
             hide_index=True,
         )
 
-    st.subheader("All Games")
-    if all_games.empty:
-        st.info("No games available for the selected market.")
-    else:
+        st.subheader("All Games")
         st.dataframe(
             all_games.style.map(style_edge, subset=["Edge"]).map(
                 style_signal,

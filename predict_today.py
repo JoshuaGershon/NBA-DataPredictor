@@ -30,6 +30,7 @@ def save_odds_cache(events, fetch_time):
     payload = {
         "last_fetch_time": fetch_time.isoformat(),
         "events": events,
+        "source": "API",
     }
     with open(CACHE_FILE, "w", encoding="utf-8") as f:
         json.dump(payload, f)
@@ -61,24 +62,51 @@ def should_call_api(now_et, last_fetch_time):
     )
 
 
-def get_events():
+def count_future_events(events):
+    now_utc = pd.Timestamp.now(tz="UTC")
+    future_count = 0
+
+    for event in events or []:
+        commence_time_utc = parse_commence_time_utc(event.get("commence_time"))
+        if commence_time_utc is not None and now_utc < commence_time_utc:
+            future_count += 1
+
+    return future_count
+
+
+def get_events(force_refresh=False):
     now_et = pd.Timestamp.now(tz=EASTERN_TZ).to_pydatetime()
+    now_utc = pd.Timestamp.now(tz="UTC").to_pydatetime()
     cache = load_odds_cache() or {}
     cached_events = cache.get("events", [])
     last_fetch_time = parse_cache_time(cache.get("last_fetch_time"))
+    cached_future_games = count_future_events(cached_events)
+    cache_has_future_games = cached_future_games > 0
+    hour_window_allows_fetch = should_call_api(now_et, last_fetch_time)
+    should_fetch = force_refresh or last_fetch_time is None or hour_window_allows_fetch or not cache_has_future_games
 
     print(f"Current ET time: {now_et.strftime('%Y-%m-%d %I:%M:%S %p %Z')}")
+    print(f"Current UTC time: {now_utc.strftime('%Y-%m-%d %H:%M:%S %Z')}")
     print(f"Last fetch time: {last_fetch_time.astimezone(EASTERN_TZ).strftime('%Y-%m-%d %I:%M:%S %p %Z') if last_fetch_time else 'None'}")
+    print(f"Number of cached future games: {cached_future_games}")
 
-    if not should_call_api(now_et, last_fetch_time):
+    if cached_events and not cache_has_future_games:
+        print("Stale cache was rejected because all games were in the past")
+
+    if not should_fetch and cache_has_future_games:
         print("USING CACHE")
+        print("Source: CACHE")
         print(f"Number of events returned: {len(cached_events)}")
         return cached_events
 
     if not API_KEY:
         print("ODDS_API_KEY not set")
-        print(f"Number of events returned: {len(cached_events)}")
-        return cached_events
+        if cache_has_future_games:
+            print("USING CACHE")
+            print("Source: CACHE")
+            print(f"Number of events returned: {len(cached_events)}")
+            return cached_events
+        return []
 
     try:
         response = requests.get(
@@ -101,14 +129,41 @@ def get_events():
         events = response.json()
         save_odds_cache(events, pd.Timestamp.now(tz='UTC').to_pydatetime())
         print("API CALL MADE")
+        print("Source: API")
         print(f"Number of events returned: {len(events)}")
         return events
     except Exception:
-        if cached_events:
+        if cache_has_future_games:
             print("USING CACHE")
+            print("Source: CACHE")
             print(f"Number of events returned: {len(cached_events)}")
             return cached_events
         raise
+
+
+def filter_future_events(events):
+    now_utc = pd.Timestamp.now(tz="UTC")
+    print(f"Current UTC time: {now_utc.isoformat()}")
+    print(f"Number of events before filtering: {len(events)}")
+
+    samples = []
+    future_events = []
+
+    for event in events:
+        commence_raw = event.get("commence_time")
+        if len(samples) < 3:
+            samples.append(commence_raw)
+
+        commence_time_utc = parse_commence_time_utc(commence_raw)
+        if commence_time_utc is None:
+            continue
+
+        if now_utc < commence_time_utc:
+            future_events.append(event)
+
+    print(f"First 3 commence_time values: {samples}")
+    print(f"Number of events after filtering: {len(future_events)}")
+    return future_events
 
 
 def load_snapshots():
@@ -616,20 +671,22 @@ def enrich_signal_columns(row, snapshots_df):
 
 def build_predictions():
     events = get_events()
+    filtered_events = filter_future_events(events)
+
+    if not filtered_events:
+        fresh_events = get_events(force_refresh=True)
+        filtered_events = filter_future_events(fresh_events)
+
     snapshots_df = load_snapshots()
-    now_utc = pd.Timestamp.now(tz="UTC")
     rows = []
     snapshot_rows = []
 
-    for event in events:
+    for event in filtered_events:
         away_team = event.get("away_team")
         home_team = event.get("home_team")
         commence_time_utc = parse_commence_time_utc(event.get("commence_time"))
 
         if not away_team or not home_team or commence_time_utc is None:
-            continue
-
-        if now_utc >= commence_time_utc:
             continue
 
         bookmaker = get_preferred_bookmaker(event)
